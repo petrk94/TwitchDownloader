@@ -291,6 +291,7 @@ class Window(Gtk.ApplicationWindow):
         self.cancelled = False
         self.lines.clear()
         self.log.set_text("")
+        self.displayed_log = ""
         self.progress.set_fraction(0)
         self.status.set_text("Läuft …")
         self.form.set_sensitive(False)
