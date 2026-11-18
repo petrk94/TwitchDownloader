@@ -1,0 +1,403 @@
+#!/usr/bin/python3
+"""GTK desktop frontend for TwitchDownloaderCLI."""
+
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import sys
+from collections import deque
+import queue
+
+try:
+    import gi
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gio, GLib, Gtk
+except (ImportError, ValueError) as error:
+    sys.exit(f"GTK 3 fehlt. Installiere python3-gi und gir1.2-gtk-3.0. ({error})")
+
+
+MODES = {
+    "videodownload": ("VOD laden", ("mp4", "m4a")),
+    "clipdownload": ("Clip laden", ("mp4",)),
+    "chatdownload": ("Chat exportieren", ("json", "html", "txt")),
+    "chatrender": ("Chat rendern", ("mp4",)),
+    "info": ("Stream-Infos", ()),
+}
+STATUS = "[STATUS] - "
+PERCENT = re.compile(r"\b(\d{1,3})\s*%")
+ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def find_cli():
+    bundled = Path(__file__).resolve().with_name("TwitchDownloaderCLI")
+    for candidate in (
+        os.getenv("TWITCH_DOWNLOADER_CLI"),
+        str(bundled),
+        "TwitchDownloaderCLI",
+    ):
+        if candidate and (executable := shutil.which(candidate)):
+            return os.path.abspath(executable)
+    return ""
+
+
+class Window(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Twitch Downloader")
+        self.set_default_size(820, 720)
+        self.connect("delete-event", self.on_close)
+        self.process = None
+        self.cancelled = False
+        self.escalation = 0
+        self.output_path = None
+        self.lines = deque(maxlen=500)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin=20)
+        self.add(outer)
+        heading = Gtk.Label(label="Twitch Downloader", xalign=0)
+        heading.get_style_context().add_class("title")
+        outer.pack_start(heading, False, False, 0)
+
+        self.form = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        outer.pack_start(self.form, False, False, 0)
+        self.mode = Gtk.ComboBoxText()
+        for key, (title, _) in MODES.items():
+            self.mode.append(key, title)
+        self.form.pack_start(self.mode, False, False, 0)
+
+        self.grid = Gtk.Grid(column_spacing=12, row_spacing=9)
+        self.form.pack_start(self.grid, False, False, 0)
+        self.fields = {}
+        self.source = self.entry("source", "Twitch-Link oder ID")
+        self.chat_file = self.entry("chat_file", "Chat-Datei", "file")
+        self.output = self.entry("output", "Speichern unter", "save")
+        self.format = Gtk.ComboBoxText()
+        self.row("format", "Format", self.format)
+
+        settings = Gtk.Expander(label="Optionen und Programme")
+        self.form.pack_start(settings, False, False, 0)
+        self.grid = Gtk.Grid(column_spacing=12, row_spacing=9, margin_top=10)
+        settings.add(self.grid)
+
+        self.quality = self.entry("quality", "Qualität")
+        self.quality.set_placeholder_text("Automatisch, z. B. 720p60")
+        self.beginning = self.entry("beginning", "Von")
+        self.ending = self.entry("ending", "Bis")
+        for field in (self.beginning, self.ending):
+            field.set_placeholder_text("z. B. 00:01:30 oder 90s")
+        self.width = self.spin("width", "Breite", 350, 2, 7680)
+        self.height = self.spin("height", "Höhe", 600, 2, 7680)
+        self.fps = self.spin("fps", "Bilder pro Sekunde", 30, 1, 120)
+        self.embed = Gtk.CheckButton(label="Emotes und Abzeichen einbetten")
+        self.row("embed", "Chat-Export", self.embed)
+        self.offline = Gtk.CheckButton(label="Eingebettete Grafiken verwenden")
+        self.row("offline", "Offline-Rendering", self.offline)
+        self.cli = self.entry("cli", "TwitchDownloaderCLI", "file")
+        self.cli.set_text(find_cli())
+        self.cli.set_placeholder_text("CLI auswählen oder neben die App legen")
+        self.ffmpeg = self.entry("ffmpeg", "FFmpeg", "file")
+        self.ffmpeg.set_placeholder_text("Automatisch aus PATH")
+
+        actions = Gtk.Box(spacing=8)
+        outer.pack_start(actions, False, False, 0)
+        self.start = Gtk.Button()
+        self.start.get_style_context().add_class("suggested-action")
+        self.start.connect("clicked", self.run_job)
+        actions.pack_start(self.start, False, False, 0)
+        self.stop = Gtk.Button(label="Abbrechen", sensitive=False)
+        self.stop.connect("clicked", self.cancel_job)
+        actions.pack_start(self.stop, False, False, 0)
+        self.open_folder = Gtk.Button(label="Zielordner öffnen", sensitive=False)
+        self.open_folder.connect("clicked", self.show_folder)
+        actions.pack_end(self.open_folder, False, False, 0)
+
+        self.status = Gtk.Label(label="Bereit", xalign=0, wrap=True, selectable=True)
+        outer.pack_start(self.status, False, False, 0)
+        self.progress = Gtk.ProgressBar()
+        outer.pack_start(self.progress, False, False, 0)
+        log = Gtk.TextView(editable=False, cursor_visible=False, monospace=True,
+                           wrap_mode=Gtk.WrapMode.CHAR)
+        self.log = log.get_buffer()
+        self.log_end = self.log.create_mark(None, self.log.get_end_iter(), False)
+        self.log_view = log
+        scroll = Gtk.ScrolledWindow(min_content_height=120, shadow_type=Gtk.ShadowType.IN)
+        scroll.add(log)
+        outer.pack_start(scroll, True, True, 0)
+
+        css = Gtk.CssProvider()
+        css.load_from_data(b".title { font-size: 25px; font-weight: bold; }")
+        heading.get_style_context().add_provider(css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        self.mode.connect("changed", self.change_mode)
+        self.format.connect("changed", self.change_extension)
+        self.show_all()
+        self.mode.set_active_id("videodownload")
+
+    def row(self, key, label, widget, button=None):
+        caption = Gtk.Label(label=label, xalign=0)
+        index = len(self.fields)
+        self.grid.attach(caption, 0, index, 1, 1)
+        self.grid.attach(widget, 1, index, 1, 1)
+        widgets = [caption, widget]
+        if button:
+            self.grid.attach(button, 2, index, 1, 1)
+            widgets.append(button)
+        self.fields[key] = widgets
+
+    def entry(self, key, label, chooser=None):
+        widget = Gtk.Entry(hexpand=True)
+        button = None
+        if chooser:
+            button = Gtk.Button(label="Durchsuchen …")
+            button.connect("clicked", self.choose_file, widget, chooser)
+        self.row(key, label, widget, button)
+        return widget
+
+    def spin(self, key, label, value, minimum, maximum):
+        widget = Gtk.SpinButton.new_with_range(minimum, maximum, 1)
+        widget.set_value(value)
+        self.row(key, label, widget)
+        return widget
+
+    def choose_file(self, _button, entry, chooser):
+        save = chooser == "save"
+        action = Gtk.FileChooserAction.SAVE if save else Gtk.FileChooserAction.OPEN
+        dialog = Gtk.FileChooserDialog(title="Datei auswählen", transient_for=self, action=action)
+        dialog.add_buttons("Abbrechen", Gtk.ResponseType.CANCEL,
+                           "Auswählen", Gtk.ResponseType.ACCEPT)
+        current = entry.get_text().strip()
+        if current:
+            path = Path(current).expanduser().absolute()
+            dialog.set_current_folder(str(path.parent))
+            if save:
+                dialog.set_current_name(path.name)
+            elif path.is_file():
+                dialog.set_filename(str(path))
+        elif save:
+            directory = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOWNLOAD)
+            dialog.set_current_folder(directory or str(Path.home()))
+            dialog.set_current_name(f'twitch.{self.format.get_active_id()}')
+        if dialog.run() == Gtk.ResponseType.ACCEPT:
+            entry.set_text(dialog.get_filename())
+        dialog.destroy()
+
+    def change_mode(self, mode):
+        key = mode.get_active_id()
+        title, extensions = MODES[key]
+        self.start.set_label(title + (" anzeigen" if key == "info" else ""))
+        visible = {"cli", "chat_file" if key == "chatrender" else "source"}
+        if extensions:
+            visible.update(("output", "format"))
+        if key in ("videodownload", "clipdownload"):
+            visible.add("quality")
+        if key in ("videodownload", "chatdownload", "chatrender"):
+            visible.update(("beginning", "ending"))
+        if key in ("videodownload", "clipdownload", "chatrender"):
+            visible.add("ffmpeg")
+        if key == "chatdownload":
+            visible.add("embed")
+        if key == "chatrender":
+            visible.update(("width", "height", "fps", "offline"))
+        for field, widgets in self.fields.items():
+            for widget in widgets:
+                widget.set_visible(field in visible)
+        self.format.remove_all()
+        for extension in extensions:
+            self.format.append(extension, extension.upper())
+        self.format.set_active(0)
+
+    def change_extension(self, _format):
+        value = self.output.get_text().strip()
+        extension = self.format.get_active_id()
+        if value and extension and not value.endswith("/"):
+            self.output.set_text(str(Path(value).with_suffix("." + extension)))
+
+    def command(self):
+        mode = self.mode.get_active_id()
+        cli = self.cli.get_text().strip()
+        if not cli:
+            raise ValueError("Wähle die Datei TwitchDownloaderCLI unter »Optionen und Programme«.")
+        executable = shutil.which(os.path.expanduser(cli))
+        if not executable:
+            raise ValueError("TwitchDownloaderCLI wurde nicht gefunden oder ist nicht ausführbar.")
+        args = [executable, mode]
+        if mode == "chatrender":
+            raw_input = self.chat_file.get_text().strip()
+            source = Path(raw_input).expanduser().absolute()
+            if not raw_input or not source.is_file():
+                raise ValueError("Wähle eine vorhandene Chat-Datei.")
+            args.extend(("--input", str(source)))
+        else:
+            source = self.source.get_text().strip()
+            if not source or source.startswith("-"):
+                raise ValueError("Gib einen Twitch-Link oder eine Twitch-ID ein.")
+            args.extend(("--id", source))
+        if mode == "info":
+            return args + ["--format", "Raw"], None
+
+        raw_output = self.output.get_text().strip()
+        if not raw_output or raw_output.endswith("/"):
+            raise ValueError("Gib einen Dateinamen zum Speichern ein.")
+        self.change_extension(self.format)
+        target = Path(self.output.get_text()).expanduser().absolute()
+        if not target.parent.is_dir() or target.is_dir():
+            raise ValueError("Wähle einen Dateinamen in einem vorhandenen Ordner.")
+        if os.path.lexists(target):
+            raise ValueError("Die Zieldatei existiert bereits. Wähle einen anderen Namen.")
+        args.extend(("--output", str(target), "--collision", "Exit"))
+
+        for flag, widget in (
+            ("quality", self.quality), ("beginning", self.beginning), ("ending", self.ending),
+        ):
+            value = widget.get_text().strip()
+            if widget.get_visible() and value:
+                if value.startswith("-"):
+                    raise ValueError("Qualität und Zeitangaben dürfen nicht mit einem Minus beginnen.")
+                args.extend(("--" + flag, value))
+
+        if self.ffmpeg.get_visible():
+            value = self.ffmpeg.get_text().strip() or "ffmpeg"
+            ffmpeg = shutil.which(os.path.expanduser(value))
+            if not ffmpeg:
+                raise ValueError("FFmpeg fehlt. Installiere es oder wähle die ausführbare Datei.")
+            args.extend(("--ffmpeg-path", os.path.abspath(ffmpeg)))
+        if mode == "chatdownload" and self.embed.get_active() and target.suffix == ".json":
+            args.append("--embed-images")
+        if mode == "chatrender":
+            width, height = self.width.get_value_as_int(), self.height.get_value_as_int()
+            if width % 2 or height % 2:
+                raise ValueError("Breite und Höhe müssen für MP4 gerade Zahlen sein.")
+            args.extend(("--chat-width", str(width), "--chat-height", str(height),
+                         "--framerate", str(self.fps.get_value_as_int())))
+            if self.offline.get_active():
+                args.append("--offline")
+        return args, target
+
+    def run_job(self, _button):
+        try:
+            args, target = self.command()
+            process = subprocess.Popen(
+                args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                errors="replace", start_new_session=True,
+            )
+        except (ValueError, OSError) as error:
+            self.status.set_text(str(error))
+            return
+
+        self.process = process
+        self.output_path = target
+        self.cancelled = False
+        self.lines.clear()
+        self.log.set_text("")
+        self.progress.set_fraction(0)
+        self.status.set_text("Läuft …")
+        self.form.set_sensitive(False)
+        self.start.set_sensitive(False)
+        self.stop.set_sensitive(True)
+        self.open_folder.set_sensitive(False)
+        self.messages = queue.Queue(maxsize=512)
+
+        def read_output():
+            with process.stdout:
+                for line in process.stdout:
+                    self.messages.put(line)
+            self.messages.put(process.wait())
+
+        from threading import Thread
+        Thread(target=read_output, daemon=True).start()
+        GLib.timeout_add(80, self.poll_job)
+
+    def poll_job(self):
+        for _ in range(200):
+            try:
+                message = self.messages.get_nowait()
+            except queue.Empty:
+                break
+            if isinstance(message, int):
+                self.finish_job(message)
+                self.flush_log()
+                return GLib.SOURCE_REMOVE
+            line = ANSI.sub("", message).strip()
+            if not line:
+                continue
+            if line.startswith(STATUS):
+                if not self.cancelled:
+                    self.status.set_text(line[len(STATUS):])
+                percent = PERCENT.search(line)
+                if percent:
+                    self.progress.set_fraction(min(int(percent[1]), 100) / 100)
+                    continue
+            self.lines.append(line[:4096])
+        self.flush_log()
+        return GLib.SOURCE_CONTINUE
+
+    def flush_log(self):
+        display = "\n".join(self.lines)
+        if display != getattr(self, "displayed_log", None):
+            self.log.set_text(display)
+            self.log_view.scroll_mark_onscreen(self.log_end)
+            self.displayed_log = display
+
+    def signal_job(self, process, sig):
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            pass
+
+    def cancel_job(self, _button):
+        if self.cancelled:
+            return
+        self.cancelled = True
+        self.stop.set_sensitive(False)
+        self.status.set_text("Wird abgebrochen …")
+        self.signal_job(self.process, signal.SIGTERM)
+        self.escalation = GLib.timeout_add_seconds(3, self.force_stop, self.process)
+
+    def force_stop(self, process):
+        self.escalation = 0
+        self.signal_job(process, signal.SIGKILL)
+        return GLib.SOURCE_REMOVE
+
+    def finish_job(self, code):
+        if self.escalation:
+            GLib.source_remove(self.escalation)
+            self.escalation = 0
+            self.signal_job(self.process, signal.SIGKILL)
+        self.process = None
+        self.form.set_sensitive(True)
+        self.start.set_sensitive(True)
+        self.stop.set_sensitive(False)
+        if self.cancelled:
+            self.status.set_text("Abgebrochen. Angefangene Dateien können im Zielordner liegen.")
+        elif code:
+            self.status.set_text(f"Vorgang fehlgeschlagen (Exit-Code {code}). Details im Protokoll.")
+        elif self.output_path and not self.output_path.is_file():
+            self.status.set_text("Die CLI hat keine Zieldatei erstellt. Details im Protokoll.")
+        else:
+            self.progress.set_fraction(1)
+            self.status.set_text(str(self.output_path) if self.output_path else "Stream-Infos geladen.")
+        self.open_folder.set_sensitive(self.output_path is not None)
+
+    def show_folder(self, _button):
+        try:
+            Gio.AppInfo.launch_default_for_uri(self.output_path.parent.as_uri(), None)
+        except GLib.Error as error:
+            self.status.set_text(str(error))
+
+    def on_close(self, *_args):
+        if self.process is None:
+            return False
+        self.cancel_job(None)
+        return True
+
+
+def main():
+    app = Gtk.Application(application_id="io.github.petrk94.TwitchDownloader")
+    app.connect("activate", lambda instance: (instance.get_active_window() or Window(instance)).present())
+    return app.run(sys.argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
