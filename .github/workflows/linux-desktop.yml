@@ -1,0 +1,45 @@
+name: Linux Desktop
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'TwitchDownloaderLinux/**'
+      - 'TwitchDownloaderCLI/**'
+      - 'TwitchDownloaderCore/**'
+      - '.github/workflows/linux-desktop.yml'
+  pull_request:
+    paths:
+      - 'TwitchDownloaderLinux/**'
+      - 'TwitchDownloaderCLI/**'
+      - 'TwitchDownloaderCore/**'
+      - '.github/workflows/linux-desktop.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.x
+      - name: Publish bundled CLI
+        run: dotnet publish TwitchDownloaderCLI -c Release -p:PublishProfile=Linux -o cli
+      - name: Build Debian package
+        run: bash TwitchDownloaderLinux/package.sh cli dist "1.0.${GITHUB_RUN_NUMBER}"
+      - name: Verify package installation and desktop startup
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xauth ./dist/*.deb
+          /usr/lib/twitch-downloader/TwitchDownloaderCLI --version
+          result=0
+          xvfb-run -a timeout 5s twitch-downloader || result=$?
+          test "$result" = 124
+      - uses: actions/upload-artifact@v7
+        with:
+          name: TwitchDownloader-Linux-amd64
+          path: dist/*.deb
+          if-no-files-found: error
